@@ -1,5 +1,4 @@
-pypdf2==3.0.1
-pdfminer.six==20221105
-flask==2.3.2
+flask
 flask-cors
-gunicorn
+pdf2docx
+python-docx
