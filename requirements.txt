@@ -1,4 +1,5 @@
 flask
 flask-cors
-pdf2docx
+python-dotenv
+ilovepdf
 python-docx
