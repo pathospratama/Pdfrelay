@@ -2,22 +2,18 @@
   "version": 2,
   "builds": [
     {
-      "src": "api/*.py",
-      "use": "@vercel/python",
-      "config": {
-        "maxLambdaSize": "250mb",
-        "includeFiles": ["api/utils/*"]
-      }
+      "src": "api/process.py",
+      "use": "@vercel/python"
     }
   ],
   "routes": [
     {
       "src": "/api/process-pdf",
-      "dest": "api/process_pdf.py"
+      "dest": "/api/process.py"
     },
     {
       "src": "/health",
-      "dest": "api/health.py"
+      "dest": "/api/process.py?health=1"
     }
   ]
 }
