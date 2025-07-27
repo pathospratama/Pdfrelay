@@ -1,161 +1,110 @@
 import os
-import uuid
-import time
 import json
-import subprocess
-import shutil
-import threading
-import logging
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from pdf2docx import Converter
-from docx import Document
 from werkzeug.utils import secure_filename
+from ilovepdf import ILovePdf
+from docx import Document
+from dotenv import load_dotenv
 
-# Konfigurasi logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Load API key
+load_dotenv()
+ILOVEPDF_PUBLIC_KEY = os.getenv('ILOVEPDF_PUBLIC_KEY')
+ilovepdf = ILovePdf(ILOVEPDF_PUBLIC_KEY, verify_ssl=True)
 
+# Flask init
 app = Flask(__name__)
 CORS(app)
 
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['ALLOWED_EXTENSIONS'] = {'pdf'}
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB
+UPLOAD_FOLDER = 'uploads'
+OUTPUT_FOLDER = 'outputs'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
-# ----------- Fungsi Konversi DOCX ke PDF via LibreOffice -----------
-def convert_docx_to_pdf(docx_path, output_pdf_path=None):
-    if not shutil.which("soffice") and not shutil.which("libreoffice"):
-        raise EnvironmentError("LibreOffice CLI tidak ditemukan. Pastikan sudah terinstall.")
-
-    output_dir = os.path.dirname(output_pdf_path or docx_path)
-    cmd = [
-        "soffice",
-        "--headless",
-        "--convert-to", "pdf",
-        "--outdir", output_dir,
-        docx_path
-    ]
-
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        generated_pdf = os.path.splitext(docx_path)[0] + ".pdf"
-
-        if output_pdf_path and os.path.abspath(generated_pdf) != os.path.abspath(output_pdf_path):
-            shutil.move(generated_pdf, output_pdf_path)
-
-        logger.info(f"Konversi DOCX ke PDF selesai: {output_pdf_path or generated_pdf}")
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Gagal konversi DOCX ke PDF: {e.stderr.decode('utf-8')}")
-
-# ----------- Fungsi Validasi File -----------
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
-
-# ----------- Konversi PDF ke DOCX -----------
-def convert_pdf_to_docx(pdf_path, docx_path):
-    if not os.path.exists(pdf_path):
-        raise Exception(f"File PDF tidak ditemukan: {pdf_path}")
-
-    cv = Converter(pdf_path)
-    cv.convert(docx_path)
-    cv.close()
-
-    if not os.path.exists(docx_path) or os.path.getsize(docx_path) == 0:
-        raise Exception(f"File DOCX tidak valid setelah konversi: {docx_path}")
-
-# ----------- Edit Isi DOCX -----------
 def edit_docx_text(docx_path, replacements):
-    if not os.path.exists(docx_path):
-        raise Exception(f"File DOCX tidak ditemukan: {docx_path}")
-
     doc = Document(docx_path)
 
-    def replace_in_runs(runs, replacements):
+    def replace_runs(runs, replacements):
         for run in runs:
             for old, new in replacements.items():
                 if old in run.text:
                     run.text = run.text.replace(old, new)
 
     for para in doc.paragraphs:
-        replace_in_runs(para.runs, replacements)
+        replace_runs(para.runs, replacements)
 
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for para in cell.paragraphs:
-                    replace_in_runs(para.runs, replacements)
+                    replace_runs(para.runs, replacements)
 
     doc.save(docx_path)
 
-# ----------- Hapus File Aman -----------
-def safe_remove(filepath):
-    try:
-        if filepath and os.path.exists(filepath):
-            os.remove(filepath)
-            logger.info(f"File dihapus: {filepath}")
-    except Exception as e:
-        logger.warning(f"Gagal hapus file {filepath}: {e}")
+@app.route('/')
+def index():
+    return jsonify({"message": "Server iLovePDF Replacement is running."})
 
-# ----------- Route Utama -----------
-@app.route('/process-pdf', methods=['POST'])
-def process_pdf():
+@app.route('/replace-pdf-text', methods=['POST'])
+def replace_pdf_text():
     if 'file' not in request.files:
         return jsonify({'error': 'File tidak ditemukan'}), 400
 
     file = request.files['file']
     if file.filename == '':
-        return jsonify({'error': 'Nama file kosong'}), 400
+        return jsonify({'error': 'File kosong'}), 400
 
-    if not allowed_file(file.filename):
-        return jsonify({'error': 'Hanya file PDF yang diperbolehkan'}), 400
+    filename = secure_filename(file.filename)
+    filepath_pdf = os.path.join(UPLOAD_FOLDER, filename)
+    file.save(filepath_pdf)
 
-    pdf_input = None
-    docx_temp = None
-    pdf_output = None
+    # Parse replacements
+    try:
+        replacements_raw = request.form.get('replacements', '{}')
+        replacements = json.loads(replacements_raw)
+    except Exception as e:
+        return jsonify({'error': 'Format replacement tidak valid'}), 400
 
     try:
-        replacements = {}
-        if request.form.get('replacements'):
-            try:
-                replacements = json.loads(request.form.get('replacements'))
-            except json.JSONDecodeError:
-                return jsonify({'error': 'Format JSON tidak valid'}), 400
+        # 1. Convert PDF to DOCX
+        task = ilovepdf.new_task('pdf2word')
+        task.add_file(filepath_pdf)
+        task.set_output_folder(OUTPUT_FOLDER)
+        task.execute()
+        task.download()
+        task.delete_current_task()
 
-        file_id = str(uuid.uuid4())
-        original_filename = secure_filename(file.filename)
-        pdf_input = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_{original_filename}")
-        docx_temp = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_temp.docx")
-        pdf_output = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_modified.pdf")
+        # 2. Temukan file DOCX hasil convert
+        docx_file = None
+        for f in os.listdir(OUTPUT_FOLDER):
+            if f.endswith('.docx'):
+                docx_file = os.path.join(OUTPUT_FOLDER, f)
+                break
 
-        file.save(pdf_input)
-        logger.info(f"File disimpan: {pdf_input}")
+        if not docx_file:
+            return jsonify({'error': 'DOCX hasil konversi tidak ditemukan'}), 500
 
-        convert_pdf_to_docx(pdf_input, docx_temp)
-        edit_docx_text(docx_temp, replacements)
-        convert_docx_to_pdf(docx_temp, pdf_output)
+        # 3. Edit teks DOCX
+        edit_docx_text(docx_file, replacements)
 
-        return send_file(
-            pdf_output,
-            as_attachment=True,
-            download_name=f"modified_{original_filename}",
-            mimetype='application/pdf'
-        )
+        # 4. Convert kembali ke PDF
+        task2 = ilovepdf.new_task('officepdf')
+        task2.add_file(docx_file)
+        task2.set_output_folder(OUTPUT_FOLDER)
+        task2.execute()
+        task2.download()
+        task2.delete_current_task()
+
+        # 5. Kirim file PDF hasil edit
+        for f in os.listdir(OUTPUT_FOLDER):
+            if f.endswith('.pdf'):
+                final_pdf = os.path.join(OUTPUT_FOLDER, f)
+                return send_file(final_pdf, as_attachment=True)
+
+        return jsonify({'error': 'Gagal mengubah ke PDF'}), 500
 
     except Exception as e:
-        logger.error(f"Proses gagal: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
-    finally:
-        def cleanup():
-            time.sleep(2)
-            safe_remove(pdf_input)
-            safe_remove(docx_temp)
-            safe_remove(pdf_output)
-        threading.Thread(target=cleanup).start()
-
-# ----------- Jalankan Server -----------
 if __name__ == '__main__':
-    app.run(debug=True, threaded=True)
+    app.run(debug=True)
