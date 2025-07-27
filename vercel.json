@@ -3,13 +3,17 @@
   "builds": [
     {
       "src": "api/*.py",
-      "use": "@vercel/python"
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "250mb",
+        "includeFiles": ["api/utils/*"]
+      }
     }
   ],
   "routes": [
     {
-      "src": "/api/(.*)",
-      "dest": "api/$1.py"
+      "src": "/api/process-pdf",
+      "dest": "api/process_pdf.py"
     },
     {
       "src": "/health",
