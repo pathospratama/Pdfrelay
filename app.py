@@ -1,99 +1,161 @@
-from flask import Flask, request, jsonify, send_file
-from PyPDF2 import PdfReader, PdfWriter
-import tempfile
-import uuid
 import os
+import uuid
+import time
 import json
+import subprocess
+import shutil
+import threading
+import logging
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from pdf2docx import Converter
+from docx import Document
+from werkzeug.utils import secure_filename
+
+# Konfigurasi logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+CORS(app)
 
-# Enable CORS
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Replacements')
-    response.headers.add('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
-    return response
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['ALLOWED_EXTENSIONS'] = {'pdf'}
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "service": "PDF Text Replacer",
-        "version": "3.0"
-    })
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-def process_pdf_replacements(input_path, replacements):
-    """Process PDF with text replacements"""
-    reader = PdfReader(input_path)
-    writer = PdfWriter()
+# ----------- Fungsi Konversi DOCX ke PDF via LibreOffice -----------
+def convert_docx_to_pdf(docx_path, output_pdf_path=None):
+    if not shutil.which("soffice") and not shutil.which("libreoffice"):
+        raise EnvironmentError("LibreOffice CLI tidak ditemukan. Pastikan sudah terinstall.")
 
-    for page in reader.pages:
-        # Extract and modify text
-        text = page.extract_text() or ""
-        for old_text, new_text in replacements.items():
-            text = text.replace(old_text, new_text)
-
-        # Add page (note: PyPDF2 can't edit text directly)
-        writer.add_page(page)
-
-    output_path = f"{tempfile.gettempdir()}/{uuid.uuid4()}_processed.pdf"
-    with open(output_path, 'wb') as f:
-        writer.write(f)
-
-    return output_path
-
-@app.route('/process-pdf', methods=['POST'])
-def handle_pdf():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-
-    file = request.files['file']
-    if not file.filename.lower().endswith('.pdf'):
-        return jsonify({"error": "Only PDF files are allowed"}), 400
-
-    # Get replacements from headers or form data
-    replacements = {}
-    if 'Replacements' in request.headers:
-        try:
-            replacements = json.loads(request.headers['Replacements'])
-        except json.JSONDecodeError:
-            pass
-    elif 'replacements' in request.form:
-        try:
-            replacements = json.loads(request.form['replacements'])
-        except json.JSONDecodeError:
-            pass
-
-    temp_pdf = None
-    output_pdf = None
+    output_dir = os.path.dirname(output_pdf_path or docx_path)
+    cmd = [
+        "soffice",
+        "--headless",
+        "--convert-to", "pdf",
+        "--outdir", output_dir,
+        docx_path
+    ]
 
     try:
-        # Save uploaded file
-        temp_pdf = f"{tempfile.gettempdir()}/{uuid.uuid4()}.pdf"
-        file.save(temp_pdf)
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        generated_pdf = os.path.splitext(docx_path)[0] + ".pdf"
 
-        # Process PDF
-        output_pdf = process_pdf_replacements(temp_pdf, replacements)
+        if output_pdf_path and os.path.abspath(generated_pdf) != os.path.abspath(output_pdf_path):
+            shutil.move(generated_pdf, output_pdf_path)
 
-        # Return processed file
+        logger.info(f"Konversi DOCX ke PDF selesai: {output_pdf_path or generated_pdf}")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Gagal konversi DOCX ke PDF: {e.stderr.decode('utf-8')}")
+
+# ----------- Fungsi Validasi File -----------
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+# ----------- Konversi PDF ke DOCX -----------
+def convert_pdf_to_docx(pdf_path, docx_path):
+    if not os.path.exists(pdf_path):
+        raise Exception(f"File PDF tidak ditemukan: {pdf_path}")
+
+    cv = Converter(pdf_path)
+    cv.convert(docx_path)
+    cv.close()
+
+    if not os.path.exists(docx_path) or os.path.getsize(docx_path) == 0:
+        raise Exception(f"File DOCX tidak valid setelah konversi: {docx_path}")
+
+# ----------- Edit Isi DOCX -----------
+def edit_docx_text(docx_path, replacements):
+    if not os.path.exists(docx_path):
+        raise Exception(f"File DOCX tidak ditemukan: {docx_path}")
+
+    doc = Document(docx_path)
+
+    def replace_in_runs(runs, replacements):
+        for run in runs:
+            for old, new in replacements.items():
+                if old in run.text:
+                    run.text = run.text.replace(old, new)
+
+    for para in doc.paragraphs:
+        replace_in_runs(para.runs, replacements)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    replace_in_runs(para.runs, replacements)
+
+    doc.save(docx_path)
+
+# ----------- Hapus File Aman -----------
+def safe_remove(filepath):
+    try:
+        if filepath and os.path.exists(filepath):
+            os.remove(filepath)
+            logger.info(f"File dihapus: {filepath}")
+    except Exception as e:
+        logger.warning(f"Gagal hapus file {filepath}: {e}")
+
+# ----------- Route Utama -----------
+@app.route('/process-pdf', methods=['POST'])
+def process_pdf():
+    if 'file' not in request.files:
+        return jsonify({'error': 'File tidak ditemukan'}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'Nama file kosong'}), 400
+
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'Hanya file PDF yang diperbolehkan'}), 400
+
+    pdf_input = None
+    docx_temp = None
+    pdf_output = None
+
+    try:
+        replacements = {}
+        if request.form.get('replacements'):
+            try:
+                replacements = json.loads(request.form.get('replacements'))
+            except json.JSONDecodeError:
+                return jsonify({'error': 'Format JSON tidak valid'}), 400
+
+        file_id = str(uuid.uuid4())
+        original_filename = secure_filename(file.filename)
+        pdf_input = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_{original_filename}")
+        docx_temp = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_temp.docx")
+        pdf_output = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_modified.pdf")
+
+        file.save(pdf_input)
+        logger.info(f"File disimpan: {pdf_input}")
+
+        convert_pdf_to_docx(pdf_input, docx_temp)
+        edit_docx_text(docx_temp, replacements)
+        convert_docx_to_pdf(docx_temp, pdf_output)
+
         return send_file(
-            output_pdf,
+            pdf_output,
             as_attachment=True,
-            download_name="processed.pdf",
+            download_name=f"modified_{original_filename}",
             mimetype='application/pdf'
         )
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        # Cleanup temporary files
-        for f in [temp_pdf, output_pdf]:
-            try:
-                if f and os.path.exists(f):
-                    os.unlink(f)
-            except:
-                pass
+        logger.error(f"Proses gagal: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
+    finally:
+        def cleanup():
+            time.sleep(2)
+            safe_remove(pdf_input)
+            safe_remove(docx_temp)
+            safe_remove(pdf_output)
+        threading.Thread(target=cleanup).start()
+
+# ----------- Jalankan Server -----------
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, threaded=True)
